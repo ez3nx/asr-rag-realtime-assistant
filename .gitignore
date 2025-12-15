@@ -1,0 +1,19 @@
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+.env/
+
+# Кеши Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Кеши и артефакты инструментов
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Логи
+*.log
