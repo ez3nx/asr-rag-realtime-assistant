@@ -320,3 +320,135 @@
 - **Интеграция и UX**: в UI показываем подсказку + источники (файл и chunk_id) + latency; кнопка “полезно/неполезно” для human-eval (оценщики: PO и DS/AB).
 - **Риски и смягчение**: низкое качество ASR → прогонять заранее, держать готовые транскрипты; нерелевантный retrieval → fallback BM25-only (disable ColBERT, уменьшить k); галлюцинации → строгий промпт, ограничение токенов, ручная проверка 3 ключевых сценариев; задержки → отключить reranker, уменьшить size, сократить max_tokens.
 - **Отчёт и решение**: таблица по сценариям (полезность, recall@5, latency p50/p95, ошибки) + логи. Решение о следующей итерации принимает PO по критериям из 3.2.
+
+---
+
+### 4. Внедрение (контур MVP-пилота)
+
+> В текущем репозитории уже реализованы отдельные сервисы (ASR и RAG) и фронтенд.
+
+#### 4.1. Архитектура решения
+
+
+```mermaid
+flowchart LR
+  subgraph Client["Оператор (браузер)"]
+    UI["Web UI (Astro)"]
+  end
+
+  subgraph AudioSvc["call-center-service: Audio API (FastAPI)"]
+    A1["POST /transcribe (audio file)"]
+    A2["WS /ws/transcribe (stream)"]
+    Tone["ToneASRService"]
+    Pipeline["check_strim_asr pipeline\n(chunker + T-one ASR + pause/VAD)"]
+  end
+
+  subgraph RagSvc["opensearch-service: RAG API (FastAPI)"]
+    R1["POST /search"]
+    R2["POST /rag/answer"]
+    Search["SearchService\n(BM25 / hybrid / HyDE / ColBERT*)"]
+    Gen["generate_answer()\n(prompt builder)"]
+  end
+
+  subgraph External["Внешние зависимости"]
+    OS["OpenSearch cluster"]
+    YEmb["Yandex FM Embeddings\n(text-search-doc)"]
+    YLLM["YandexGPT-lite\n(completion)"]
+  end
+
+  UI -->|audio/webm,wav| A1
+  UI -->|audio chunks| A2
+  A1 --> Tone --> Pipeline -->|transcript| UI
+  A2 --> Tone --> Pipeline
+
+  UI -->|query=text| R2
+  R2 --> Search --> OS
+  Search -->|optional| YEmb
+  R2 --> Gen -->|optional| YLLM
+  R2 -->|answer + sources| UI
+
+  %% offline
+  subgraph Offline["Offline контур подготовки БЗ"]
+    NB["Jupyter notebooks\n(opensearch_index_*.ipynb)"]
+    KB["Синтетическая БЗ (md)\nчанки + метаданные"]
+  end
+  KB --> NB --> OS
+```
+
+\* ColBERT/HyDE — опциональные улучшения качества, включаются флагами запроса и наличием креденшелов/ресурсов.
+
+**Назначение компонентов:**
+- **UI** (`itmo-call-center-assistant.github.io`): запись/загрузка аудио, запрос ASR, отправка транскрипта в RAG, показ ответа + источников.
+- **Audio API** (`call-center-service/scripts/api/audio_api.py`): HTTP/WS интерфейс для STT, инкапсулирует локальный ASR пайплайн.
+- **check_strim_asr**: библиотека/пайплайн streaming ASR (T-one) + детектор пауз (VAD/phrase/hybrid) + (опционально) summary.
+- **RAG API** (`opensearch-service/scripts/api/main_simple.py`): поиск по индексу + генерация ответа (LLM) на основе найденных чанков.
+- **OpenSearch**: хранение индекса и быстрый поиск (BM25 / kNN / hybrid), масштабируется отдельно от API.
+
+#### 4.2. Описание инфраструктуры и масштабируемости
+
+**MVP-пилот (самый простой контур):**
+- **1 VM** (Linux) + `docker-compose`:
+  - `frontend` (astro)
+  - `audio-service` (FastAPI/uvicorn, CPU)
+  - `rag-api` (FastAPI/uvicorn)
+  - `opensearch` (single-node) + persistent volume
+- **Секреты**: `.env` (для пилота) → в проде заменить на Secret Manager (Vault / KMS / cloud secrets).
+
+**Как масштабируем:**
+- **RAG API**: горизонтально (N replicas) за счёт stateless‑логики; ограничивающий фактор — OpenSearch и LLM API quota.
+- **Audio API**: горизонтально (N replicas) или через очередь задач; ограничивающий фактор — CPU/GPU на ASR.
+- **OpenSearch**: scale-out (шардинг + реплики) и/или увеличение ресурсов (RAM/CPU/SSD).
+
+#### 4.3. Требования к работе системы (SLA/SLO)
+
+**SLO по задержке (MVP):**
+- **end-to-end p95 ≤ 5 c** от окончания реплики клиента до появления подсказки в UI.
+- Рекомендуемый budget по стадиям:
+  - ASR (локально): p95 ≤ 2.5 c на реплику (зависит от длины аудио)
+  - Retrieval (OpenSearch): p95 ≤ 0.5 c
+  - LLM completion: p95 ≤ 1.5–2.0 c при `max_tokens ≤ 300`
+  - UI/network overhead: ≤ 0.2–0.3 c
+
+**Надёжность:**
+- Доступность сервисов на время пилота: **≥ 99%** (best-effort).
+- Fallback‑режимы:
+  - LLM недоступен → показываем только найденные документы + шаблон ответа
+  - OpenSearch недоступен → показываем “не найдено” и просим уточнить запрос
+  - ASR недоступен → ручной ввод текста в UI
+
+**Пропускная способность (ориентиры пилота):**
+- 5–20 операторов, 1–2 запроса в минуту на оператора в пике.
+- Целевая устойчивость: **~1–5 RPS** на RAG контур и **~0.5–2 RPS** на ASR контур (с запасом).
+
+#### 4.4. Безопасность системы
+
+**Потенциальные уязвимости и меры:**
+- **Нет аутентификации** в текущих FastAPI сервисах → добавить API‑ключи/JWT + mTLS внутри контура.
+- **CORS allow\_origins="*"** → в проде ограничить доменом фронтенда.
+- **Rate limiting**: защитить `/rag/answer` и `/transcribe` от DoS (например, nginx/ingress + token bucket).
+- **TLS**: только HTTPS для внешнего трафика; внутри контура — mTLS (по возможности).
+- **Secrets**: убрать `.env` из runtime, использовать Secret Manager + ротацию ключей.
+
+#### 4.5. Безопасность данных
+
+- Потенциально аудио/транскрипты могут содержать PII → логировать минимально, добавить маскирование (телефон, паспорт, карты) перед отправкой в LLM.
+- Retention: хранить логи/транскрипты ограниченно (например, 7–30 дней) и по согласованной политике.
+- Доступ: RBAC к OpenSearch/логам; аудит доступа.
+
+#### 4.6. Integration points
+
+**UI → Audio API (`:8001`)**
+- `GET /health`
+- `POST /transcribe` (multipart form-data, поле `file`)
+- `WS /ws/transcribe` (байты аудио чанков)
+
+**UI → RAG API (`:8000`)**
+- `GET /health`
+- `POST /rag/answer` (JSON: `query`, `size`, `index_name`, `use_hyde`, `use_colbert`)
+- `POST /search`
+
+#### 4.7. Нагрузочное тестирование (результаты)
+
+**Цель:** измерить пропускную способность и latency HTTP‑API при конкурентной нагрузке.
+
+Не проводилось (
